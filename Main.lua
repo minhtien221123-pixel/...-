@@ -114,6 +114,17 @@ local function getMapContent()
     return ig and ig:FindFirstChild("Map")
 end
 
+-- FIX: centralised Network require so path is corrected in one place
+local _networkModule = nil
+local function getNetwork()
+    if _networkModule then return _networkModule end
+    local ok, m = pcall(function()
+        return require(svc.RS.Modules.Network.Network)
+    end)
+    if ok and m then _networkModule = m end
+    return _networkModule
+end
+
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
 -- TAB: SETTINGS
@@ -221,10 +232,12 @@ local platEnabled = cfg.get("platEnabled", false)
 local platDevice  = cfg.get("platDevice",  "Console")
 local platLoop    = nil
 local platConn    = nil
+
+-- FIX: use getNetwork() helper instead of bare require(svc.RS.Modules.Network)
 local function platPush()
     if not platEnabled then return end
-    local ok, net = pcall(function() return require(svc.RS.Modules.Network) end)
-    if ok and net then pcall(function() net:FireServerConnection("SetDevice", "REMOTE_EVENT", platDevice) end) end
+    local net = getNetwork()
+    if net then pcall(function() net:FireServerConnection("SetDevice", "REMOTE_EVENT", platDevice) end) end
 end
 local function platStart()
     if platLoop then return end; platPush()
@@ -260,6 +273,8 @@ local stam = {
     noLoss  = cfg.get("stamNoLoss",  false),
     thread  = nil,
 }
+
+-- FIX: corrected path — verify this in your explorer under ReplicatedStorage.Systems
 local function stamModule()
     local ok, m = pcall(function() return require(svc.RS.Systems.Character.Game.Sprinting) end)
     return ok and m or nil
@@ -269,14 +284,16 @@ local function stamIsKiller()
     local kf = getTeamFolder("Killers")
     return kf and ch:IsDescendantOf(kf)
 end
-
 local function stamApply()
     local m = stamModule(); if not m then return end
     if not m.DefaultsSet then pcall(function() m.Init() end) end
     local forceNoLoss = stam.noLoss or stamIsKiller()
-    m.StaminaLoss = stam.loss
-    m.StaminaGain = stam.gain
-    m.MaxStamina = stam.max
+    m.StaminaLoss = stam.loss; m.StaminaGain = stam.gain
+    local abilityCapActive = type(m.StaminaCap) == "number" and m.StaminaCap < (m.MaxStamina or math.huge)
+    if not abilityCapActive then
+        m.MaxStamina = stam.max
+        if type(m.StaminaCap) == "number" then m.StaminaCap = stam.max end
+    end
     m.StaminaLossDisabled = forceNoLoss
     if m.Stamina and m.Stamina > stam.max then m.Stamina = stam.current end
     pcall(function() if m.__staminaChangedEvent then m.__staminaChangedEvent:Fire() end end)
@@ -302,13 +319,8 @@ secStamina:Slider({ Title = "Max Pool",      Step = 1, Value = { Min = 50, Max =
 secStamina:Slider({ Title = "Current Value", Step = 1, Value = { Min = 0,  Max = 500, Default = stam.current }, Callback = function(v) stam.current = v; cfg.set("stamCurrent", v) end })
 secStamina:Toggle({ Title = "Infinite Stamina", Type = "Checkbox", Default = stam.noLoss,
     Callback = function(on)
-        stam.noLoss = on
-        cfg.set("stamNoLoss", on)
-        stamApply()
-        if on and not stam.on then
-            stam.on = true
-            stamStart()
-        end
+        stam.noLoss = on; cfg.set("stamNoLoss", on); stamApply()
+        if on and not stam.on then stam.on = true; stamStart() end
     end
 })
 if stam.on then stamStart() end
@@ -319,10 +331,17 @@ lp.CharacterAdded:Connect(function()
 end)
 
 local secStatus = tabGlobal:Section({ Title = "Status", Opened = true })
+-- FIX: correct paths confirmed as Modules.Schematics.StatusEffects.*
+-- Glitched is a LocalScript inside KillerExclusive.Glitched.Frame — handled separately
 local statusGroups = {
-    Slowness      = { on = false, paths = { "Modules.StatusEffects.Slowness" } },
-    Hallucination = { on = false, paths = { "Modules.StatusEffects.KillerExclusive.Hallucination" } },
-    Visual        = { on = false, paths = { "Modules.StatusEffects.Blindness", "Modules.StatusEffects.KillerExclusive.Glitched", "Modules.StatusEffects.SurvivorExclusive.Subspaced" } },
+    Slowness      = { on = false, paths = { "Modules.Schematics.StatusEffects.Slowness" } },
+    Hallucination = { on = false, paths = { "Modules.Schematics.StatusEffects.KillerExclusive.Hallucination" } },
+    Visual        = { on = false, paths = {
+        "Modules.Schematics.StatusEffects.Blindness",
+        "Modules.Schematics.StatusEffects.SurvivorExclusive.Subspaced",
+        -- Glitched is a LocalScript inside a Frame, destroyed via parent folder instead
+        "Modules.Schematics.StatusEffects.KillerExclusive.Glitched",
+    }},
 }
 local statusBackup = {}
 local function statusResolve(path)
@@ -333,13 +352,25 @@ end
 local function statusBlock(path)
     if statusBackup[path] then return end
     local mod = statusResolve(path)
-    if mod and mod:IsA("ModuleScript") then statusBackup[path] = { clone = mod:Clone(), src = mod.Source }; mod:Destroy() end
+    if not mod then return end
+    -- Glitched is a Folder containing a Frame containing a LocalScript — destroy the folder
+    if mod:IsA("Folder") then
+        statusBackup[path] = { clone = mod:Clone(), isFolder = true, parentPath = path:match("^(.-)%.?[^%.]+$") }
+        mod:Destroy()
+    elseif mod:IsA("ModuleScript") or mod:IsA("LocalScript") then
+        statusBackup[path] = { clone = mod:Clone(), src = mod.Source, isFolder = false }
+        mod:Destroy()
+    end
 end
 local function statusRestore(path)
     local saved = statusBackup[path]; if not saved then return end
     local existing = statusResolve(path); if existing then existing:Destroy() end
-    local parentPath = path:match("^(.-)%.?[^%.]+$"); local parent = statusResolve(parentPath)
-    if parent then saved.clone.Source = saved.src; saved.clone.Parent = parent end
+    local parentPath = saved.parentPath or path:match("^(.-)%.?[^%.]+$")
+    local parent = statusResolve(parentPath)
+    if parent then
+        if not saved.isFolder then saved.clone.Source = saved.src end
+        saved.clone.Parent = parent
+    end
     statusBackup[path] = nil
 end
 local statusLoopThread = nil
@@ -369,37 +400,15 @@ lp.CharacterAdded:Connect(function()
     if statusLoopThread then task.cancel(statusLoopThread); statusLoopThread = nil end
 end)
 
-local secNetwork = tabGlobal:Section({ Title = "Network", Opened = true })
-local net = { ghost = false, lag = false, block = false, lagRunning = false }
-local function netGhostOn()  net.block = true end
-local function netGhostOff() net.block = net.lag end
-local function netLagOn()
-    if net.lagRunning then return end; net.lagRunning = true
-    task.spawn(function()
-        while net.lag do net.block = true; task.wait(2); if not net.lag then break end; net.block = false; task.wait(2) end
-        net.lagRunning = false
-    end)
-end
-local function netLagOff() net.lagRunning = false; net.block = net.ghost end
-lp.CharacterAdded:Connect(function() net.ghost = false; net.lag = false; net.block = false; net.lagRunning = false end)
-task.spawn(function()
-    local mods = svc.RS:FindFirstChild("Modules"); if not mods then return end
-    local netf  = mods:FindFirstChild("Network");  if not netf  then return end
-    local ure   = netf:FindFirstChild("UnreliableRemoteEvent"); if not ure then return end
-    local old
-    old = hookmetamethod(game, "__namecall", function(self, ...)
-        if getnamecallmethod() == "FireServer" and self == ure then
-            local a = {...}; if #a > 0 and a[1] == "UpdCF" and net.block then return end
-        end; return old(self, ...)
-    end)
-end)
-secNetwork:Toggle({ Title = "Ghost Mode", Type = "Checkbox", Default = false, Callback = function(on) net.ghost = on; if on then netGhostOn() else netGhostOff() end end })
-secNetwork:Toggle({ Title = "Lag Mode",   Type = "Checkbox", Default = false, Callback = function(on) net.lag   = on; if on then netLagOn()   else netLagOff()   end end })
-
+------------------------------------------------------------------------
+-- HITBOX
+-- FIX: get the RemoteEvent through the Network module instead of
+--      trying to index it as a child of the Network ModuleScript
+------------------------------------------------------------------------
 local secHitbox = tabGlobal:Section({ Title = "Hitbox", Opened = true })
 local hb = { on = cfg.get("hbOn", false), strength = cfg.get("hbStrength", 50), conn = nil, active = {} }
 local hbAbilities = { Slash=1,Swing=1,Dagger=1,Charge=1,Punch=1,PlasmaBeam=1,Shoot=1,Behead=1,GashingWound=1,CorruptNature=1,WalkspeedOverride=1,Stab=1,Nova=1,MassInfection=1,Entanglement=1,Axe=1 }
-local hbRemote = svc.RS:WaitForChild("Modules"):WaitForChild("Network"):WaitForChild("RemoteEvent")
+
 local function hbReadName(raw)
     if typeof(raw) == "buffer" then local s = buffer.tostring(raw); return s:match("[%a]+") or s:gsub("[^%w]","") end
     return tostring(raw):gsub("\"","")
@@ -412,9 +421,27 @@ local function hbPush(dist)
     svc.Run.RenderStepped:Wait()
     if ch and ch.Parent and r and r.Parent then r.AssemblyLinearVelocity = was end
 end
+
+-- FIX: direct path confirmed from checker: ReplicatedStorage.Modules.Network.Network.RemoteEvent
+-- Do NOT use GetRemote() or WaitForChild — both block indefinitely if the remote isn't ready
+local _hbRemote = nil
+local function hbGetRemote()
+    if _hbRemote and _hbRemote.Parent then return _hbRemote end
+    local ok, re = pcall(function()
+        return svc.RS.Modules.Network.Network:FindFirstChild("RemoteEvent")
+    end)
+    if ok and re then _hbRemote = re; return re end
+    return nil
+end
+
 local function hbStart()
     if hb.conn then return end
-    hb.conn = hbRemote.OnClientEvent:Connect(function(action, data)
+    local remote = hbGetRemote()
+    if not remote then
+        warn("[v1prware] hbStart: could not find RemoteEvent for hitbox — feature disabled")
+        return
+    end
+    hb.conn = remote.OnClientEvent:Connect(function(action, data)
         if not hb.on or action ~= "UseActorAbility" then return end
         if typeof(data) ~= "table" or not data[1] then return end
         local name = hbReadName(data[1])
@@ -450,49 +477,110 @@ local secGenAuto = tabGen:Section({ Title = "Auto Solve", Opened = true })
 
 local flow = { on = cfg.get("flowOn", false), nodeDelay = cfg.get("flowNodeDelay", 0.04), lineDelay = cfg.get("flowLineDelay", 0.60) }
 local function flowKey(n) return n.row.."-"..n.col end
-local function flowDir(r1,c1,r2,c2) if r2<r1 then return"up" elseif r2>r1 then return"down" elseif c2<c1 then return"left" elseif c2>c1 then return"right" end end
-local function flowDirFlip(d) return({up="down",down="up",left="right",right="left"})[d] end
 local function flowNeighbour(r1,c1,r2,c2)
     if r2==r1-1 and c2==c1 then return"up" end; if r2==r1+1 and c2==c1 then return"down" end
     if r2==r1 and c2==c1-1 then return"left" end; if r2==r1 and c2==c1+1 then return"right" end; return false
 end
-local function flowConnections(prev,curr,nxt)
-    local t={}
-    if prev and curr then local d=flowDir(curr.row,curr.col,prev.row,prev.col); if d then t[flowDirFlip(d)]=true end end
-    if nxt  and curr then local d=flowDir(curr.row,curr.col,nxt.row,nxt.col);  if d then t[d]=true end end
-    return t
-end
-local function flowOrder(path,endpoints)
-    if not path or #path==0 then return path end
-    local lookup={}; for _,n in ipairs(path) do lookup[flowKey(n)]=n end
+local function flowOrder(path, endpoints)
+    if not path or #path == 0 then return path end
+    local lookup = {}
+    for _, n in ipairs(path) do lookup[flowKey(n)] = n end
     local start
-    for _,ep in ipairs(endpoints or{}) do for _,n in ipairs(path) do if n.row==ep.row and n.col==ep.col then start={row=ep.row,col=ep.col};break end end; if start then break end end
-    if not start then for _,n in ipairs(path) do local nb=0; for _,d in ipairs({{-1,0},{1,0},{0,-1},{0,1}}) do if lookup[(n.row+d[1]).."-"..(n.col+d[2])] then nb+=1 end end; if nb==1 then start={row=n.row,col=n.col};break end end end
-    if not start then start={row=path[1].row,col=path[1].col} end
-    local pool={}; local ordered={}; for _,n in ipairs(path) do pool[flowKey(n)]={row=n.row,col=n.col} end
-    local cur=start; table.insert(ordered,{row=cur.row,col=cur.col}); pool[flowKey(cur)]=nil
-    while next(pool) do local moved=false; for k,node in pairs(pool) do if flowNeighbour(cur.row,cur.col,node.row,node.col) then table.insert(ordered,{row=node.row,col=node.col}); pool[k]=nil; cur=node; moved=true; break end end; if not moved then break end end
+    -- prefer starting from a known endpoint
+    for _, ep in ipairs(endpoints or {}) do
+        for _, n in ipairs(path) do
+            if n.row == ep.row and n.col == ep.col then
+                start = { row = ep.row, col = ep.col }
+                break
+            end
+        end
+        if start then break end
+    end
+    -- fall back to any dead-end node (only one neighbour in path)
+    if not start then
+        for _, n in ipairs(path) do
+            local nb = 0
+            for _, d in ipairs({{-1,0},{1,0},{0,-1},{0,1}}) do
+                if lookup[(n.row+d[1]).."-"..(n.col+d[2])] then nb += 1 end
+            end
+            if nb == 1 then start = { row = n.row, col = n.col }; break end
+        end
+    end
+    if not start then start = { row = path[1].row, col = path[1].col } end
+    local pool, ordered = {}, {}
+    for _, n in ipairs(path) do pool[flowKey(n)] = { row = n.row, col = n.col } end
+    local cur = start
+    table.insert(ordered, { row = cur.row, col = cur.col })
+    pool[flowKey(cur)] = nil
+    while next(pool) do
+        local moved = false
+        for k, node in pairs(pool) do
+            if flowNeighbour(cur.row, cur.col, node.row, node.col) then
+                table.insert(ordered, { row = node.row, col = node.col })
+                pool[k] = nil; cur = node; moved = true; break
+            end
+        end
+        if not moved then break end
+    end
     return ordered
 end
 local function flowSolve(puzzle)
     if not puzzle or not puzzle.Solution then return end
-    local indices={}; for i=1,#puzzle.Solution do indices[i]=i end
-    for i=#indices,2,-1 do local j=math.random(1,i); indices[i],indices[j]=indices[j],indices[i] end
-    for _,ci in ipairs(indices) do
-        local ordered=flowOrder(puzzle.Solution[ci],puzzle.targetPairs[ci]); puzzle.paths[ci]={}
-        for i,node in ipairs(ordered) do
-            table.insert(puzzle.paths[ci],{row=node.row,col=node.col})
-            puzzle.gridConnections=puzzle.gridConnections or{}
-            puzzle.gridConnections[flowKey(node)]=flowConnections(ordered[i-1],node,ordered[i+1])
-            puzzle:updateGui(); task.wait(flow.nodeDelay)
-        end; task.wait(flow.lineDelay); puzzle:checkForWin()
+    -- shuffle solve order so it looks more natural
+    local indices = {}
+    for i = 1, #puzzle.Solution do indices[i] = i end
+    for i = #indices, 2, -1 do
+        local j = math.random(1, i)
+        indices[i], indices[j] = indices[j], indices[i]
+    end
+    for _, ci in ipairs(indices) do
+        local solution = puzzle.Solution[ci]
+        if not solution then continue end
+        -- order the path starting from one of the target endpoints
+        local ordered = flowOrder(solution, puzzle.targetPairs[ci])
+        if not ordered or #ordered == 0 then continue end
+        -- reset this color's path then write nodes one by one
+        puzzle.paths[ci] = {}
+        for _, node in ipairs(ordered) do
+            table.insert(puzzle.paths[ci], { row = node.row, col = node.col })
+            -- updateGui rebuilds connections internally via getGrid() — no manual gridConnections needed
+            puzzle:updateGui()
+            task.wait(flow.nodeDelay)
+        end
+        task.wait(flow.lineDelay)
+        puzzle:checkForWin()
     end
 end
+
+-- FIX: FlowGameManager is a Folder — FlowGame is the ModuleScript inside it
+-- The module returns the u61 class table; hook u61.new to intercept new puzzle instances
 do
-    local mod = svc.RS:FindFirstChild("Modules") and svc.RS.Modules:FindFirstChild("Misc")
-        and svc.RS.Modules.Misc:FindFirstChild("FlowGameManager") and svc.RS.Modules.Misc.FlowGameManager:FindFirstChild("FlowGame")
-    if mod then local FG=require(mod); local orig=FG.new; FG.new=function(...) local p=orig(...); if flow.on then task.spawn(function() task.wait(0.3); flowSolve(p) end) end; return p end end
+    local modFolder  = svc.RS:FindFirstChild("Modules")
+    local miniFolder = modFolder and modFolder:FindFirstChild("Minigames")
+    local fgFolder   = miniFolder and miniFolder:FindFirstChild("FlowGameManager")
+    local fgModule   = fgFolder and fgFolder:FindFirstChild("FlowGame")
+    if fgModule then
+        local ok, FG = pcall(require, fgModule)
+        if ok and FG and FG.new then
+            local orig = FG.new
+            FG.new = function(...)
+                local p = orig(...)
+                if flow.on then
+                    task.spawn(function()
+                        task.wait(0.3) -- let Init() finish and GUI tween begin
+                        flowSolve(p)
+                    end)
+                end
+                return p
+            end
+        else
+            warn("[v1prware] FlowGame: failed to require FlowGame module — auto-solve disabled")
+        end
+    else
+        warn("[v1prware] FlowGame: Modules.Minigames.FlowGameManager.FlowGame not found — auto-solve disabled")
+    end
 end
+
 secGenAuto:Toggle({ Title = "Auto Solve", Type = "Checkbox", Default = flow.on, Callback = function(on) flow.on = on; cfg.set("flowOn", on) end })
 secGenAuto:Slider({ Title = "Node Speed", Step = 0.02, Value = { Min = 0.01, Max = 0.50, Default = flow.nodeDelay }, Callback = function(v) flow.nodeDelay = v; cfg.set("flowNodeDelay", v) end })
 secGenAuto:Slider({ Title = "Line Pause", Step = 0.10, Value = { Min = 0.00, Max = 1.00, Default = flow.lineDelay }, Callback = function(v) flow.lineDelay = v; cfg.set("flowLineDelay", v) end })
@@ -542,22 +630,31 @@ svc.Run.RenderStepped:Connect(function()
     local flat=Vector3.new(aim.target.Position.X-aim.hrp.Position.X,0,aim.target.Position.Z-aim.hrp.Position.Z).Unit
     if flat.Magnitude>0 then aim.hrp.CFrame=aim.hrp.CFrame:Lerp(CFrame.new(aim.hrp.Position,aim.hrp.Position+flat),aim.smooth) end
 end)
-do
-    local remote; pcall(function() remote=svc.RS:WaitForChild("Modules",10):WaitForChild("Network",10):WaitForChild("RemoteEvent",10) end)
-    if remote then remote.OnClientEvent:Connect(function(...)
-        if not aim.on then return end; local a={...}; if typeof(a[1])~="string" then return end; local n=a[1]
+
+-- FIX: use getNetwork()/hbGetRemote() instead of WaitForChild on Network as a folder
+task.spawn(function()
+    local remote = hbGetRemote()
+    if not remote then
+        warn("[v1prware] Aimbot: could not find RemoteEvent — aimbot trigger disabled")
+        return
+    end
+    remote.OnClientEvent:Connect(function(...)
+        if not aim.on then return end
+        local a={...}; if typeof(a[1])~="string" then return end; local n=a[1]
         if not (n:match("Ability") or n:match("[QER]") or n=="Slash" or n=="Dagger" or n=="Charge") then return end
         if tick()-aim.lastFired<aim.cooldown then return end; aim.lastFired=tick()
         if aimAmIKiller() then local t=aimNearest(); if t then aimLock(t) end end
-    end) end
-end
+    end)
+end)
+
 lp.CharacterAdded:Connect(function(ch) task.wait(0.5); aimRefreshChar(ch) end)
 if lp.Character then aimRefreshChar(lp.Character) end
-secAimbot:Toggle({ Title="Enable Aimbot", Type="Checkbox", Default=aim.on, Callback=function(on) aim.on=on; cfg.set("aimOn",on); if not on then aimUnlock() end end })
-secAimbot:Slider({ Title="Cooldown (s)",       Step=0.05, Value={Min=0.1, Max=2.0, Default=aim.cooldown}, Callback=function(v) aim.cooldown=v; cfg.set("aimCooldown",v) end })
-secAimbot:Slider({ Title="Lock Time (s)",      Step=0.1,  Value={Min=0.1, Max=3.0, Default=aim.lockTime}, Callback=function(v) aim.lockTime=v; cfg.set("aimLockTime",v)  end })
-secAimbot:Slider({ Title="Max Distance",       Step=5,    Value={Min=5,   Max=100, Default=aim.maxDist},  Callback=function(v) aim.maxDist=v;  cfg.set("aimMaxDist",v)   end })
-secAimbot:Slider({ Title="Rotation Smoothing", Step=0.05, Value={Min=0.05,Max=1.0, Default=aim.smooth},  Callback=function(v) aim.smooth=v;   cfg.set("aimSmooth",v)    end })
+
+secAimbot:Toggle({ Title="Enable Aimbot",      Type="Checkbox", Default=aim.on,       Callback=function(on) aim.on=on;       cfg.set("aimOn",on);       if not on then aimUnlock() end end })
+secAimbot:Slider({ Title="Cooldown (s)",        Step=0.05, Value={Min=0.1, Max=2.0, Default=aim.cooldown}, Callback=function(v) aim.cooldown=v; cfg.set("aimCooldown",v) end })
+secAimbot:Slider({ Title="Lock Time (s)",       Step=0.1,  Value={Min=0.1, Max=3.0, Default=aim.lockTime}, Callback=function(v) aim.lockTime=v; cfg.set("aimLockTime",v)  end })
+secAimbot:Slider({ Title="Max Distance",        Step=5,    Value={Min=5,   Max=100, Default=aim.maxDist},  Callback=function(v) aim.maxDist=v;  cfg.set("aimMaxDist",v)   end })
+secAimbot:Slider({ Title="Rotation Smoothing",  Step=0.05, Value={Min=0.05,Max=1.0, Default=aim.smooth},  Callback=function(v) aim.smooth=v;   cfg.set("aimSmooth",v)    end })
 
 local secABS = tabKiller:Section({ Title = "Anti-Backstab", Opened = true })
 local abs = { on=cfg.get("absOn",false), range=cfg.get("absRange",40), duration=cfg.get("absDur",1.5), locked=false, soundConn=nil, scanThread=nil, rings={} }
@@ -622,14 +719,12 @@ secABS:Slider({ Title="Look Duration (s)", Step=0.1,Value={Min=0.3,Max=5.0,Defau
 -- KILLER ABILITY CONTROLS
 ------------------------------------------------------------------------
 
--- ── Sixer Air Strafe ─────────────────────────────────────────────────
--- Binds at Character+2 so it runs AFTER the game's Character+1 velocity write.
+-- Sixer Air Strafe
 local sixerStrafeOn = cfg.get("sixerStrafeOn", false)
 local SIXER_BIND    = "LunawareSixerStrafe"
 svc.Run:BindToRenderStep(SIXER_BIND, Enum.RenderPriority.Character.Value + 2, function()
     if not sixerStrafeOn then return end
-    local char = lp.Character
-    if not char then return end
+    local char = lp.Character; if not char then return end
     if char:GetAttribute("PursuitState") ~= "Dashing" then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local hum = char:FindFirstChildOfClass("Humanoid")
@@ -639,18 +734,16 @@ svc.Run:BindToRenderStep(SIXER_BIND, Enum.RenderPriority.Character.Value + 2, fu
     local flat = cam.CFrame.LookVector * Vector3.new(1, 0, 1)
     if flat.Magnitude < 0.01 then return end
     flat = flat.Unit
-    local vel    = hrp.AssemblyLinearVelocity
-    local hVel   = Vector3.new(vel.X, 0, vel.Z)
-    local hSpeed = hVel.Magnitude
+    local vel   = hrp.AssemblyLinearVelocity
+    local hVel  = Vector3.new(vel.X, 0, vel.Z)
+    local hSpeed= hVel.Magnitude
     if hSpeed < 0.1 then return end
     local newH = hVel:Lerp(flat * hSpeed, 1)
     hrp.AssemblyLinearVelocity = Vector3.new(newH.X, vel.Y, newH.Z)
 end)
 
--- ── c00lkidd Dash Turn (WSO) ─────────────────────────────────────────
--- Redirects the LinearVelocity LineDirection using WASD + camera during c00lkidd's dash.
+-- c00lkidd Dash Turn (WSO)
 local coolkidWSOOn = cfg.get("coolkidWSOOn", false)
-
 local function coolkidGetInputDir()
     local cf       = svc.WS.CurrentCamera.CFrame
     local camFwd   = Vector3.new(cf.LookVector.X,  0, cf.LookVector.Z)
@@ -665,7 +758,6 @@ local function coolkidGetInputDir()
     if camFwd.Magnitude > 0.01 then return camFwd.Unit end
     return Vector3.new(0, 0, -1)
 end
-
 svc.Run.RenderStepped:Connect(function(dt)
     if not coolkidWSOOn then return end
     local char = lp.Character
@@ -681,27 +773,20 @@ svc.Run.RenderStepped:Connect(function(dt)
     end
 end)
 
--- ── Noli Void Rush ────────────────────────────────────────────────────
--- Forces forward movement at dash speed while Noli's VoidRushState == "Dashing".
+-- Noli Void Rush
 local noliVoidRushOn     = cfg.get("noliVoidRushOn", false)
 local noliOverrideActive = false
 local noliOrigWalkSpeed  = nil
 local noliConn           = nil
-
 local function noliStop()
     if not noliOverrideActive then return end
     noliOverrideActive = false
     local char = lp.Character
     local hum  = char and char:FindFirstChild("Humanoid")
-    if hum then
-        hum.WalkSpeed  = noliOrigWalkSpeed or 16
-        hum.AutoRotate = true
-        pcall(function() hum:Move(Vector3.new(0, 0, 0)) end)
-    end
+    if hum then hum.WalkSpeed=noliOrigWalkSpeed or 16; hum.AutoRotate=true; pcall(function() hum:Move(Vector3.new(0,0,0)) end) end
     noliOrigWalkSpeed = nil
     if noliConn then noliConn:Disconnect(); noliConn = nil end
 end
-
 local function noliStart()
     if noliOverrideActive then return end
     noliOverrideActive = true
@@ -711,56 +796,23 @@ local function noliStart()
         local root = char and char:FindFirstChild("HumanoidRootPart")
         if not hum or not root then return end
         if not noliOrigWalkSpeed then noliOrigWalkSpeed = hum.WalkSpeed end
-        hum.WalkSpeed  = 60
-        hum.AutoRotate = false
+        hum.WalkSpeed=60; hum.AutoRotate=false
         local horiz = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
         if horiz.Magnitude > 0 then hum:Move(horiz.Unit) end
     end)
 end
-
 svc.Run.RenderStepped:Connect(function()
-    if not noliVoidRushOn then
-        if noliOverrideActive then noliStop() end
-        return
-    end
-    local char = lp.Character
-    if not char then return end
-    if char:GetAttribute("VoidRushState") == "Dashing" then
-        noliStart()
-    else
-        noliStop()
-    end
+    if not noliVoidRushOn then if noliOverrideActive then noliStop() end; return end
+    local char = lp.Character; if not char then return end
+    if char:GetAttribute("VoidRushState") == "Dashing" then noliStart() else noliStop() end
 end)
+lp.CharacterAdded:Connect(function() noliStop(); noliOrigWalkSpeed = nil end)
 
-lp.CharacterAdded:Connect(function()
-    noliStop()
-    noliOrigWalkSpeed = nil
-end)
-
--- ── Killer Ability UI ─────────────────────────────────────────────────
+-- Killer Ability UI
 local secKillerAbilities = tabKiller:Section({ Title = "Killer Abilities", Opened = true })
-
-secKillerAbilities:Toggle({
-    Title    = "Sixer — Air Strafe",
-    Type     = "Checkbox",
-    Default  = sixerStrafeOn,
-    Callback = function(on) sixerStrafeOn = on; cfg.set("sixerStrafeOn", on) end
-})
-secKillerAbilities:Toggle({
-    Title    = "c00lkidd — Dash Turn",
-    Type     = "Checkbox",
-    Default  = coolkidWSOOn,
-    Callback = function(on) coolkidWSOOn = on; cfg.set("coolkidWSOOn", on) end
-})
-secKillerAbilities:Toggle({
-    Title    = "Noli — Void Rush Control",
-    Type     = "Checkbox",
-    Default  = noliVoidRushOn,
-    Callback = function(on)
-        noliVoidRushOn = on; cfg.set("noliVoidRushOn", on)
-        if not on then noliStop() end
-    end
-})
+secKillerAbilities:Toggle({ Title="Sixer — Air Strafe",       Type="Checkbox", Default=sixerStrafeOn, Callback=function(on) sixerStrafeOn=on; cfg.set("sixerStrafeOn",on) end })
+secKillerAbilities:Toggle({ Title="c00lkidd — Dash Turn",     Type="Checkbox", Default=coolkidWSOOn,  Callback=function(on) coolkidWSOOn=on;  cfg.set("coolkidWSOOn",on)  end })
+secKillerAbilities:Toggle({ Title="Noli — Void Rush Control", Type="Checkbox", Default=noliVoidRushOn,Callback=function(on) noliVoidRushOn=on; cfg.set("noliVoidRushOn",on); if not on then noliStop() end end })
 
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
@@ -776,17 +828,8 @@ local esp = {
     generators = cfg.get("espGenerators", false),
     items      = cfg.get("espItems",      false),
     buildings  = cfg.get("espBuildings",  false),
-
-    killerFolder   = nil,
-    survivorFolder = nil,
-    mapFolder      = nil,
-
-    playerConns = {},
-    mapConns    = {},
-    healthConns = {},
-    progConns   = {},
-    guardConns  = {},
-    ready       = false,
+    killerFolder=nil, survivorFolder=nil, mapFolder=nil,
+    playerConns={}, mapConns={}, healthConns={}, progConns={}, guardConns={}, ready=false,
 }
 
 local function espItemColor(name)
@@ -796,14 +839,32 @@ local function espItemColor(name)
     return Color3.fromRGB(0, 230, 230)
 end
 
+local function espItemHeld(obj)
+    for _, plr in ipairs(svc.Players:GetPlayers()) do
+        local ch = plr.Character
+        if ch and obj:IsDescendantOf(ch) then return true end
+        local bp = plr:FindFirstChildOfClass("Backpack")
+        if bp and obj:IsDescendantOf(bp) then return true end
+    end
+    return false
+end
+
 local espAttach
 local espDetach
 
 espAttach = function(obj, tag, color, isChar)
     if not obj or not obj.Parent then return end
-    if obj:FindFirstChild(tag) then return end
+    if obj:FindFirstChild(tag) and obj:FindFirstChild(tag.."_bb") then return end
+    if esp.guardConns[obj]  then pcall(function() esp.guardConns[obj]:Disconnect()  end); esp.guardConns[obj]  = nil end
+    if esp.healthConns[obj] then pcall(function() esp.healthConns[obj]:Disconnect() end); esp.healthConns[obj] = nil end
+    if esp.progConns[obj]   then pcall(function() esp.progConns[obj]:Disconnect()   end); esp.progConns[obj]   = nil end
+    pcall(function()
+        local h = obj:FindFirstChild(tag);        if h then h:Destroy() end
+        local b = obj:FindFirstChild(tag.."_bb"); if b then b:Destroy() end
+    end)
     local root = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart") or obj:FindFirstChild("Base") or obj:FindFirstChild("Main")
     if not root then for _,d in ipairs(obj:GetDescendants()) do if d:IsA("BasePart") then root=d; break end end end
+    if not root and obj:IsA("BasePart") then root = obj end
     if not root then return end
     pcall(function()
         local hl = Instance.new("Highlight"); hl.Name=tag; hl.FillColor=color; hl.FillTransparency=0.8; hl.OutlineColor=color; hl.OutlineTransparency=0; hl.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; hl.Adornee=obj; hl.Parent=obj
@@ -811,18 +872,28 @@ espAttach = function(obj, tag, color, isChar)
         local lbl = Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.TextColor3=color; lbl.TextStrokeTransparency=0.5; lbl.TextStrokeColor3=Color3.new(0,0,0); lbl.TextSize=15; lbl.FontFace=Font.new("rbxasset://fonts/families/AccanthisADFStd.json"); lbl.Parent=bb
         if isChar then
             local hum=obj:FindFirstChildOfClass("Humanoid")
-            if hum then lbl.Text=obj.Name.." (100%)"; local c=hum.HealthChanged:Connect(function() if lbl.Parent then lbl.Text=obj.Name.." ("..math.floor(hum.Health/hum.MaxHealth*100).."%" .. ")" end end); esp.healthConns[obj]=c
+            if hum then
+                lbl.Text=obj.Name.." (100%)"
+                local c=hum.HealthChanged:Connect(function() if lbl.Parent then lbl.Text=obj.Name.." ("..math.floor(hum.Health/hum.MaxHealth*100).."%)"; end end)
+                esp.healthConns[obj]=c
             else lbl.Text=obj.Name end
         else
             local prog=obj:FindFirstChild("Progress")
-            if prog and prog:IsA("NumberValue") then lbl.Text=math.floor(prog.Value).."%"; local c=prog.Changed:Connect(function() if lbl.Parent then lbl.Text=math.floor(prog.Value).."%" end end); esp.progConns[obj]=c
+            if prog and prog:IsA("NumberValue") then
+                lbl.Text=math.floor(prog.Value).."%"
+                local c=prog.Changed:Connect(function() if lbl.Parent then lbl.Text=math.floor(prog.Value).."%" end end)
+                esp.progConns[obj]=c
             else lbl.Text=obj.Name end
         end
     end)
     if esp.guardConns[obj] then pcall(function() esp.guardConns[obj]:Disconnect() end) end
     esp.guardConns[obj] = obj.ChildRemoved:Connect(function(removed)
         if removed.Name~=tag and removed.Name~=(tag.."_bb") then return end
-        task.defer(function() if obj.Parent then espAttach(obj,tag,color,isChar) end end)
+        task.defer(function()
+            if not obj or not obj.Parent then return end
+            if not isChar and espItemHeld(obj) then return end
+            espAttach(obj,tag,color,isChar)
+        end)
     end)
 end
 
@@ -849,8 +920,13 @@ local function espDoGenerators(on)
     for _,obj in ipairs(map:GetChildren()) do if obj.Name=="Generator" then if on then espAttach(obj,"esp_g",Color3.fromRGB(255,105,180),false) else espDetach(obj,"esp_g") end end end
 end
 local function espDoItems(on)
-    local map=getMapContent(); if not map then return end
-    for _,obj in ipairs(map:GetChildren()) do if obj.Name=="BloxyCola" or obj.Name=="Medkit" then if on then espAttach(obj,"esp_i",espItemColor(obj.Name),false) else espDetach(obj,"esp_i") end end end
+    for _,obj in ipairs(svc.WS:GetDescendants()) do
+        if obj.Name=="BloxyCola" or obj.Name=="Medkit" then
+            if not espItemHeld(obj) then
+                if on then espAttach(obj,"esp_i",espItemColor(obj.Name),false) else espDetach(obj,"esp_i") end
+            end
+        end
+    end
 end
 local function espDoBuildings(on)
     local ig=getIngame(); if not ig then return end
@@ -868,7 +944,6 @@ local function espBindPlayers()
         table.insert(esp.playerConns, esp.survivorFolder.ChildRemoved:Connect(function(ch) espDetach(ch,"esp_s") end))
     end
 end
-
 local function espBindWorld()
     for _,c in pairs(esp.mapConns) do if c.Connected then c:Disconnect() end end; esp.mapConns={}
     local ig=getIngame(); if not ig then return end
@@ -877,8 +952,8 @@ local function espBindWorld()
         if esp.buildings and (obj.Name=="BuildermanSentry" or obj.Name=="SubspaceTripmine" or obj.Name=="BuildermanDispenser") then espAttach(obj,"esp_b",Color3.fromRGB(255,80,0),false) end
         if obj.Name=="Map" then
             task.wait(1); esp.mapFolder=obj
-            obj.ChildAdded:Connect(function(child) task.wait(0.2); if esp.generators and child.Name=="Generator" then espAttach(child,"esp_g",Color3.fromRGB(255,105,180),false) end; if esp.items and (child.Name=="BloxyCola" or child.Name=="Medkit") then espAttach(child,"esp_i",espItemColor(child.Name),false) end end)
-            obj.ChildRemoved:Connect(function(child) if child.Name=="Generator" then espDetach(child,"esp_g") end; if child.Name=="BloxyCola" or child.Name=="Medkit" then espDetach(child,"esp_i") end end)
+            obj.ChildAdded:Connect(function(child) task.wait(0.2); if esp.generators and child.Name=="Generator" then espAttach(child,"esp_g",Color3.fromRGB(255,105,180),false) end end)
+            obj.ChildRemoved:Connect(function(child) if child.Name=="Generator" then espDetach(child,"esp_g") end end)
             if esp.generators then task.spawn(function() espDoGenerators(true) end) end
             if esp.items      then task.spawn(function() espDoItems(true) end)      end
         end
@@ -886,6 +961,11 @@ local function espBindWorld()
     table.insert(esp.mapConns, ig.ChildRemoved:Connect(function(obj)
         if obj.Name=="BuildermanSentry" or obj.Name=="SubspaceTripmine" then espDetach(obj,"esp_b") end
         if obj.Name=="Map" then esp.mapFolder=nil end
+    end))
+    table.insert(esp.mapConns, svc.WS.DescendantAdded:Connect(function(obj)
+        if not esp.items then return end
+        if obj.Name ~= "BloxyCola" and obj.Name ~= "Medkit" then return end
+        task.wait(0.2); if obj and obj.Parent and not espItemHeld(obj) then espAttach(obj,"esp_i",espItemColor(obj.Name),false) end
     end))
     local existing=getMapContent(); if existing then esp.mapFolder=existing; task.spawn(function() task.wait(2); if esp.generators then espDoGenerators(true) end; if esp.items then espDoItems(true) end end) end
 end
@@ -897,18 +977,11 @@ secESP:Toggle({ Title="Items",      Type="Checkbox", Default=esp.items,      Cal
 secESP:Toggle({ Title="Buildings",  Type="Checkbox", Default=esp.buildings,  Callback=function(on) esp.buildings=on;  cfg.set("espBuildings",on);  task.spawn(function() espDoBuildings(on)  end) end })
 
 ------------------------------------------------------------------------
--- Minion + Puddle ESP  (working names from confirmed standalone script)
+-- Minion + Puddle ESP
 ------------------------------------------------------------------------
 local secMinion = tabVisual:Section({ Title = "Minion & Ability ESP", Opened = true })
-
-local mset = {
-    pizza  = cfg.get("espPizza",  false),
-    zombie = cfg.get("espZombie", false),
-    puddle = cfg.get("espPuddle", false),
-    transparency = cfg.get("espMinionTrans", 0.25),
-}
-
-local tracked = { pizza = {}, zombie = {}, puddle = {} }
+local mset = { pizza=cfg.get("espPizza",false), zombie=cfg.get("espZombie",false), puddle=cfg.get("espPuddle",false), transparency=cfg.get("espMinionTrans",0.25) }
+local tracked = { pizza={}, zombie={}, puddle={} }
 
 local function isRealPlayer(obj)
     for _, plr in ipairs(svc.Players:GetPlayers()) do
@@ -917,163 +990,88 @@ local function isRealPlayer(obj)
     end
     return false
 end
-
 local function addHighlight(obj, color, tag, label, offset)
     if not obj or tracked[tag][obj] then return end
     if isRealPlayer(obj) then return end
     tracked[tag][obj] = true
-
     local root = obj
     if obj:IsA("Model") then
         root = obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChild("Torso") or obj.PrimaryPart
         if not root then for _, child in ipairs(obj:GetChildren()) do if child:IsA("BasePart") then root=child; break end end end
     end
-
     local hl = Instance.new("Highlight")
-    hl.Name = tag.."_HL"; hl.FillColor = color; hl.FillTransparency = mset.transparency
-    hl.OutlineColor = color; hl.OutlineTransparency = 0.1
-    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop; hl.Adornee = obj; hl.Parent = obj
-
+    hl.Name=tag.."_HL"; hl.FillColor=color; hl.FillTransparency=mset.transparency; hl.OutlineColor=color; hl.OutlineTransparency=0.1; hl.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; hl.Adornee=obj; hl.Parent=obj
     if root then
         local bb = Instance.new("BillboardGui"); bb.Name=tag.."_BB"; bb.Adornee=root; bb.Size=UDim2.new(0,130,0,24); bb.StudsOffset=Vector3.new(0,offset or 3,0); bb.AlwaysOnTop=true; bb.Parent=obj
         local lbl = Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=color; lbl.TextStrokeColor3=Color3.new(0,0,0); lbl.TextStrokeTransparency=0.2; lbl.TextSize=12; lbl.Font=Enum.Font.GothamBold; lbl.Parent=bb
     end
-
     local conn; conn = obj.AncestryChanged:Connect(function()
         if obj.Parent then return end; conn:Disconnect(); hl:Destroy()
         local bb=obj:FindFirstChild(tag.."_BB"); if bb then bb:Destroy() end
         tracked[tag][obj] = nil
     end)
 end
-
 local function updateTransparency()
-    for tag, tbl in pairs(tracked) do
-        for obj in pairs(tbl) do
-            local hl = obj:FindFirstChild(tag.."_HL")
-            if hl then hl.FillTransparency = mset.transparency end
-        end
-    end
+    for tag, tbl in pairs(tracked) do for obj in pairs(tbl) do local hl=obj:FindFirstChild(tag.."_HL"); if hl then hl.FillTransparency=mset.transparency end end end
 end
-
 local function clearTag(tag)
     for obj in pairs(tracked[tag]) do
-        local hl = obj:FindFirstChild(tag.."_HL"); if hl then hl:Destroy() end
-        local bb = obj:FindFirstChild(tag.."_BB"); if bb then bb:Destroy() end
-        if tag == "puddle" then local h = obj:FindFirstChild("PuddleHolder"); if h then h:Destroy() end end
+        local hl=obj:FindFirstChild(tag.."_HL"); if hl then hl:Destroy() end
+        local bb=obj:FindFirstChild(tag.."_BB"); if bb then bb:Destroy() end
+        if tag=="puddle" then local h=obj:FindFirstChild("PuddleHolder"); if h then h:Destroy() end end
     end
-    tracked[tag] = {}
+    tracked[tag]={}
 end
-
--- ── Puddle highlight (black disc + thin red outline) ─────────────────
 local function addPuddleHighlight(part, color, tag, label)
     if not part or tracked[tag][part] then return end
     if isRealPlayer(part) then return end
     tracked[tag][part] = true
-
-    -- Standard through-wall highlight
     local hl = Instance.new("Highlight")
-    hl.Name=tag.."_HL"; hl.FillColor=color; hl.FillTransparency=mset.transparency
-    hl.OutlineColor=color; hl.OutlineTransparency=0.1
-    hl.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; hl.Adornee=part; hl.Parent=part
-
+    hl.Name=tag.."_HL"; hl.FillColor=color; hl.FillTransparency=mset.transparency; hl.OutlineColor=color; hl.OutlineTransparency=0.1; hl.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; hl.Adornee=part; hl.Parent=part
     task.wait(0.05)
-
-    local puddleSize = math.max(part.Size.X, part.Size.Z)
-    local radius = math.max(puddleSize * 0.5, 3)
-
-    local holder = Instance.new("Part")
-    holder.Name="PuddleHolder"; holder.Size=Vector3.new(1,0.1,1); holder.Transparency=1
-    holder.CanCollide=false; holder.Anchored=true
-    holder.Position=part.Position+Vector3.new(0,0.05,0); holder.Parent=part
-
-    -- BLACK DISC — Height = 0.02 (thin)
-    local blackCircle = Instance.new("CylinderHandleAdornment")
-    blackCircle.Name="PuddleBlack"; blackCircle.Adornee=holder
-    blackCircle.Color3=Color3.fromRGB(0,0,0); blackCircle.Transparency=0.2
-    blackCircle.Radius=radius; blackCircle.Height=0.02   -- THIN
-    blackCircle.CFrame=CFrame.Angles(math.rad(90),0,0)
-    blackCircle.ZIndex=5; blackCircle.AlwaysOnTop=true; blackCircle.Parent=holder
-
-    -- RED OUTLINE — Height = 0.02 (thin)
-    local redOutline = Instance.new("CylinderHandleAdornment")
-    redOutline.Name="PuddleRed"; redOutline.Adornee=holder
-    redOutline.Color3=Color3.fromRGB(255,0,0); redOutline.Transparency=0.4
-    redOutline.Radius=radius+0.8; redOutline.Height=0.02   -- THIN
-    redOutline.CFrame=CFrame.Angles(math.rad(90),0,0)
-    redOutline.ZIndex=4; redOutline.AlwaysOnTop=true; redOutline.Parent=holder
-
-    -- Label
-    local bb = Instance.new("BillboardGui"); bb.Name=tag.."_BB"; bb.Adornee=holder; bb.Size=UDim2.new(0,140,0,20); bb.StudsOffset=Vector3.new(0,1.5,0); bb.AlwaysOnTop=true; bb.Parent=holder
-    local lbl = Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=Color3.fromRGB(255,255,255); lbl.TextStrokeColor3=Color3.fromRGB(255,0,0); lbl.TextStrokeTransparency=0.1; lbl.TextSize=11; lbl.Font=Enum.Font.GothamBold; lbl.Parent=bb
-
-    local sizeConn; sizeConn = part:GetPropertyChangedSignal("Size"):Connect(function()
+    local puddleSize=math.max(part.Size.X,part.Size.Z); local radius=math.max(puddleSize*0.5,3)
+    local holder=Instance.new("Part"); holder.Name="PuddleHolder"; holder.Size=Vector3.new(1,0.1,1); holder.Transparency=1; holder.CanCollide=false; holder.Anchored=true; holder.Position=part.Position+Vector3.new(0,0.05,0); holder.Parent=part
+    local blackCircle=Instance.new("CylinderHandleAdornment"); blackCircle.Name="PuddleBlack"; blackCircle.Adornee=holder; blackCircle.Color3=Color3.fromRGB(0,0,0); blackCircle.Transparency=0.2; blackCircle.Radius=radius; blackCircle.Height=0.02; blackCircle.CFrame=CFrame.Angles(math.rad(90),0,0); blackCircle.ZIndex=5; blackCircle.AlwaysOnTop=true; blackCircle.Parent=holder
+    local redOutline=Instance.new("CylinderHandleAdornment"); redOutline.Name="PuddleRed"; redOutline.Adornee=holder; redOutline.Color3=Color3.fromRGB(255,0,0); redOutline.Transparency=0.4; redOutline.Radius=radius+0.8; redOutline.Height=0.02; redOutline.CFrame=CFrame.Angles(math.rad(90),0,0); redOutline.ZIndex=4; redOutline.AlwaysOnTop=true; redOutline.Parent=holder
+    local bb=Instance.new("BillboardGui"); bb.Name=tag.."_BB"; bb.Adornee=holder; bb.Size=UDim2.new(0,140,0,20); bb.StudsOffset=Vector3.new(0,1.5,0); bb.AlwaysOnTop=true; bb.Parent=holder
+    local lbl=Instance.new("TextLabel"); lbl.Size=UDim2.new(1,0,1,0); lbl.BackgroundTransparency=1; lbl.Text=label; lbl.TextColor3=Color3.fromRGB(255,255,255); lbl.TextStrokeColor3=Color3.fromRGB(255,0,0); lbl.TextStrokeTransparency=0.1; lbl.TextSize=11; lbl.Font=Enum.Font.GothamBold; lbl.Parent=bb
+    local sizeConn; sizeConn=part:GetPropertyChangedSignal("Size"):Connect(function()
         if not part.Parent then sizeConn:Disconnect(); return end
-        local nr = math.max(math.max(part.Size.X,part.Size.Z)*0.5, 3)
-        blackCircle.Radius=nr; redOutline.Radius=nr+0.8
+        local nr=math.max(math.max(part.Size.X,part.Size.Z)*0.5,3); blackCircle.Radius=nr; redOutline.Radius=nr+0.8
     end)
-
-    local conn; conn = part.AncestryChanged:Connect(function()
+    local conn; conn=part.AncestryChanged:Connect(function()
         if part.Parent then return end; conn:Disconnect()
-        pcall(function() sizeConn:Disconnect() end)
-        pcall(function() hl:Destroy() end)
-        pcall(function() holder:Destroy() end)
-        tracked[tag][part] = nil
+        pcall(function() sizeConn:Disconnect() end); pcall(function() hl:Destroy() end); pcall(function() holder:Destroy() end)
+        tracked[tag][part]=nil
     end)
 end
-
--- ── Puddle detector ───────────────────────────────────────────────────
 local function isJohnDoePuddle(obj)
     if not obj:IsA("BasePart") then return false end
     if obj.Name ~= "Shadow" then return false end
     local parent = obj.Parent
     return parent and parent.Name:find("Shadows$") ~= nil
 end
-
--- ── Scan functions ───────────────────────────────────────────────────
 local function scanPizza()
     if not mset.pizza then return end
-    for _,obj in ipairs(svc.WS:GetDescendants()) do
-        if obj.Name=="PizzaDeliveryRig" and obj:IsA("Model") and not isRealPlayer(obj) and not tracked.pizza[obj] then
-            addHighlight(obj, Color3.fromRGB(255,100,0), "pizza", "C00LKIDD PIZZA DELIVERY", 3)
-        end
-    end 
+    for _,obj in ipairs(svc.WS:GetDescendants()) do if obj.Name=="PizzaDeliveryRig" and obj:IsA("Model") and not isRealPlayer(obj) and not tracked.pizza[obj] then addHighlight(obj,Color3.fromRGB(255,100,0),"pizza","C00LKIDD PIZZA DELIVERY",3) end end
 end
-
 local function scanZombie()
     if not mset.zombie then return end
-    for _,obj in ipairs(svc.WS:GetDescendants()) do
-        if obj.Name=="1x1x1x1Zombie" and obj:IsA("Model") and not isRealPlayer(obj) and not tracked.zombie[obj] then
-            addHighlight(obj, Color3.fromRGB(80,255,120), "zombie", "1X1X1X1 ZOMBIE", 3)
-        end
-    end
+    for _,obj in ipairs(svc.WS:GetDescendants()) do if obj.Name=="1x1x1x1Zombie" and obj:IsA("Model") and not isRealPlayer(obj) and not tracked.zombie[obj] then addHighlight(obj,Color3.fromRGB(80,255,120),"zombie","1X1X1X1 ZOMBIE",3) end end
 end
-
 local function scanPuddles()
     if not mset.puddle then return end
-    for _,obj in ipairs(svc.WS:GetDescendants()) do
-        if isJohnDoePuddle(obj) and not tracked.puddle[obj] then
-            addPuddleHighlight(obj, Color3.fromRGB(255,50,50), "puddle", "JOHN DOE PUDDLE")
-        end
-    end
+    for _,obj in ipairs(svc.WS:GetDescendants()) do if isJohnDoePuddle(obj) and not tracked.puddle[obj] then addPuddleHighlight(obj,Color3.fromRGB(255,50,50),"puddle","JOHN DOE PUDDLE") end end
 end
-
--- ── Live watcher ─────────────────────────────────────────────────────
 local function setupMinionWatcher()
     svc.WS.DescendantAdded:Connect(function(obj)
         task.wait(0.1); if not obj or not obj.Parent then return end
-        if mset.pizza and obj.Name=="PizzaDeliveryRig" and obj:IsA("Model") and not isRealPlayer(obj) and not tracked.pizza[obj] then
-            addHighlight(obj, Color3.fromRGB(255,100,0), "pizza", "C00LKIDD PIZZA DELIVERY", 3)
-        end
-        if mset.zombie and obj.Name=="1x1x1x1Zombie" and obj:IsA("Model") and not isRealPlayer(obj) and not tracked.zombie[obj] then
-            addHighlight(obj, Color3.fromRGB(80,255,120), "zombie", "1X1X1X1 ZOMBIE", 3)
-        end
-        if mset.puddle and isJohnDoePuddle(obj) and not tracked.puddle[obj] then
-            task.wait(0.15); if obj.Parent then addPuddleHighlight(obj, Color3.fromRGB(255,50,50), "puddle", "JOHN DOE PUDDLE") end
-        end
+        if mset.pizza  and obj.Name=="PizzaDeliveryRig"  and obj:IsA("Model") and not isRealPlayer(obj) and not tracked.pizza[obj]  then addHighlight(obj,Color3.fromRGB(255,100,0),"pizza","C00LKIDD PIZZA DELIVERY",3) end
+        if mset.zombie and obj.Name=="1x1x1x1Zombie"     and obj:IsA("Model") and not isRealPlayer(obj) and not tracked.zombie[obj] then addHighlight(obj,Color3.fromRGB(80,255,120),"zombie","1X1X1X1 ZOMBIE",3) end
+        if mset.puddle and isJohnDoePuddle(obj) and not tracked.puddle[obj] then task.wait(0.15); if obj.Parent then addPuddleHighlight(obj,Color3.fromRGB(255,50,50),"puddle","JOHN DOE PUDDLE") end end
     end)
 end
 
--- ── Periodic safety rescan (core + minion) ───────────────────────────
 task.spawn(function()
     while true do
         task.wait(3)
@@ -1086,13 +1084,11 @@ task.spawn(function()
     end
 end)
 
--- ── Boot ─────────────────────────────────────────────────────────────
 task.spawn(function()
     task.wait(3)
-    local pf = svc.WS:FindFirstChild("Players")
+    local pf=svc.WS:FindFirstChild("Players")
     if pf then
-        esp.killerFolder   = pf:FindFirstChild("Killers")
-        esp.survivorFolder = pf:FindFirstChild("Survivors")
+        esp.killerFolder=pf:FindFirstChild("Killers"); esp.survivorFolder=pf:FindFirstChild("Survivors")
         espBindPlayers()
         if esp.killers   then task.spawn(function() espDoKillers(true)   end) end
         if esp.survivors then task.spawn(function() espDoSurvivors(true) end) end
@@ -1103,7 +1099,7 @@ task.spawn(function()
     if mset.pizza  then scanPizza()   end
     if mset.zombie then scanZombie()  end
     if mset.puddle then scanPuddles() end
-    esp.ready = true
+    esp.ready=true
 end)
 
 lp.CharacterAdded:Connect(function()
@@ -1118,33 +1114,11 @@ lp.CharacterAdded:Connect(function()
     if mset.puddle then scanPuddles() end
 end)
 
--- ── Minion UI ─────────────────────────────────────────────────────────
-secMinion:Toggle({
-    Title = "c00lkidd Pizza Bots", Desc = "PizzaDeliveryRig — orange highlight",
-    Type = "Checkbox", Default = mset.pizza,
-    Callback = function(on) mset.pizza = on; cfg.set("espPizza", on); if on then scanPizza() else clearTag("pizza") end end
-})
-secMinion:Toggle({
-    Title = "1x1x1x1 Zombies", Desc = "1x1x1x1Zombie — green highlight",
-    Type = "Checkbox", Default = mset.zombie,
-    Callback = function(on) mset.zombie = on; cfg.set("espZombie", on); if on then scanZombie() else clearTag("zombie") end end
-})
-secMinion:Toggle({
-    Title = "JD Digital Footprints", Desc = "Black disc + red glow — Shadow in [User]Shadows",
-    Type = "Checkbox", Default = mset.puddle,
-    Callback = function(on) mset.puddle = on; cfg.set("espPuddle", on); if on then scanPuddles() else clearTag("puddle") end end
-})
-secMinion:Slider({
-    Title = "Highlight Transparency", Step = 0.05, Value = { Min = 0, Max = 1, Default = mset.transparency },
-    Callback = function(v) mset.transparency = v; cfg.set("espMinionTrans", v); updateTransparency() end
-})
-secMinion:Button({
-    Title = "🔄 Force Rescan",
-    Callback = function()
-        clearTag("pizza"); clearTag("zombie"); clearTag("puddle")
-        task.wait(0.1); scanPizza(); scanZombie(); scanPuddles()
-    end
-})
+secMinion:Toggle({ Title="c00lkidd Pizza Bots",   Desc="PizzaDeliveryRig — orange highlight", Type="Checkbox", Default=mset.pizza,  Callback=function(on) mset.pizza=on;  cfg.set("espPizza",on);  if on then scanPizza()   else clearTag("pizza")  end end })
+secMinion:Toggle({ Title="1x1x1x1 Zombies",       Desc="1x1x1x1Zombie — green highlight",     Type="Checkbox", Default=mset.zombie, Callback=function(on) mset.zombie=on; cfg.set("espZombie",on); if on then scanZombie()  else clearTag("zombie") end end })
+secMinion:Toggle({ Title="JD Digital Footprints", Desc="Black disc + red glow",               Type="Checkbox", Default=mset.puddle, Callback=function(on) mset.puddle=on; cfg.set("espPuddle",on); if on then scanPuddles() else clearTag("puddle") end end })
+secMinion:Slider({ Title="Highlight Transparency", Step=0.05, Value={Min=0,Max=1,Default=mset.transparency}, Callback=function(v) mset.transparency=v; cfg.set("espMinionTrans",v); updateTransparency() end })
+secMinion:Button({ Title="🔄 Force Rescan", Callback=function() clearTag("pizza"); clearTag("zombie"); clearTag("puddle"); task.wait(0.1); scanPizza(); scanZombie(); scanPuddles() end })
 
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
@@ -1185,34 +1159,25 @@ local function musicFetch(name)
     if not fs.hasFile(path) then local ok,data=pcall(function() return game:HttpGet(url) end); if not ok or not data or #data==0 then return nil end; fs.write(path,data) end
     music.cached[name]=fs.asset(path); return music.cached[name]
 end
-local function musicGetSound() local t=svc.WS:FindFirstChild("Themes"); return t and t:FindFirstChild("LastSurvivor") end
+-- FIX: LastSurvivor sound only exists during a round, not in lobby.
+-- Poll for it so musicGetSound() always returns the live instance if present.
+local function musicGetSound()
+    local t = svc.WS:FindFirstChild("Themes")
+    if not t then return nil end
+    -- Try direct child first, then deep search in case it's nested
+    return t:FindFirstChild("LastSurvivor") or t:FindFirstChild("LastSurvivor", true)
+end
 local function musicPlay(name)
     local snd=musicGetSound(); if not snd then return false end
     if not music.origId then music.origId=snd.SoundId end
     local asset=musicFetch(name); if not asset then return false end
-    -- Always reassign SoundId and restart to fix the "doesn't start" bug where
-    -- the sound object already has the right ID but IsPlaying is false.
-    snd.SoundId = asset
-    snd:Stop()
-    task.wait()
-    snd:Play()
-    return true
+    snd.SoundId=asset; snd:Stop(); task.wait(); snd:Play(); return true
 end
 local function musicReset() local snd=musicGetSound(); if snd and music.origId then snd.SoundId=music.origId; snd:Stop(); task.wait(); snd:Play() end end
 local function musicIsLMS()
-    -- Primary: exactly 1 survivor alive = LMS
     local sf=getTeamFolder("Survivors")
-    if sf then
-        local alive=0
-        for _,s in ipairs(sf:GetChildren()) do
-            local h=s:FindFirstChildOfClass("Humanoid")
-            if h and h.Health>0 then alive+=1 end
-        end
-        if alive==1 then return true end
-    end
-    -- Fallback: the LMS sound track itself is playing and hasn't been replaced
-    local snd=musicGetSound()
-    return snd and snd.IsPlaying and (not music.origId or snd.SoundId~=music.origId)
+    if sf then local alive=0; for _,s in ipairs(sf:GetChildren()) do local h=s:FindFirstChildOfClass("Humanoid"); if h and h.Health>0 then alive+=1 end end; if alive==1 then return true end end
+    local snd=musicGetSound(); return snd and snd.IsPlaying and (not music.origId or snd.SoundId~=music.origId)
 end
 local function musicMonitor()
     local i=0
@@ -1220,16 +1185,9 @@ local function musicMonitor()
         i+=1
         if musicIsLMS() then
             local snd=musicGetSound()
-            -- FIX: also trigger if sound exists but isn't currently playing,
-            -- so the song always starts even if the LMS transition fires before
-            -- the sound object becomes active.
-            if not snd or not snd.IsPlaying or snd.SoundId~=(music.cached[music.selected] or "") then
-                musicPlay(music.selected)
-            end
+            if not snd or not snd.IsPlaying or snd.SoundId~=(music.cached[music.selected] or "") then musicPlay(music.selected) end
             task.wait(3)
-        else
-            task.wait(1)
-        end
+        else task.wait(1) end
     end
 end
 secLMS:Toggle({ Title="Auto-Play on LMS", Type="Checkbox", Default=music.on, Callback=function(on) music.on=on; cfg.set("musicOn",on); if on then music.thread=task.spawn(musicMonitor) else if music.thread then task.cancel(music.thread); music.thread=nil end; musicReset() end end })
@@ -1244,19 +1202,20 @@ lp.CharacterAdded:Connect(function() task.wait(3); if music.on then if music.thr
 -- TAB: CHARACTER
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
-local tabChar = win:Tab({ Title = "Character", Icon = "user" })
+local tabChar      = win:Tab({ Title = "Character", Icon = "user" })
 local secKillers   = tabChar:Section({ Title = "Killers",   Opened = false })
-secKillers:Button({ Title="Slasher", Locked=true, Callback=function() loadstring(game:HttpGet(""))() end })
-local secSurvivors = tabChar:Section({ Title = "Survivors", Locked=true, Opened = true })
-secSurvivors:Button({ Title="Veeronica", Locked=true, Callback=function() loadstring(game:HttpGet(""))() end })
+secKillers:Button({ Title="Slasher",   Locked=true, Callback=function() end })
+local secSurvivors = tabChar:Section({ Title = "Survivors", Opened = true })
+secSurvivors:Button({ Title="Veeronica", Locked=true, Callback=function() end })
 local secSentinels = tabChar:Section({ Title = "Sentinels", Opened = true })
-secSentinels:Button({ Title="Guest1337",  Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/Kx5U4bLL"))() end })
-secSentinels:Button({ Title="Shedletsky (just use hitbox lol)", Locked=true, Callback=function() loadstring(game:HttpGet(""))() end })
-secSentinels:Button({ Title="Chance",     Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/XnXQY5VD"))() end })
-secSentinels:Button({ Title="TwoTime",    Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/4v3iUxhN"))() end })
-local secSupports  = tabChar:Section({ Title = "Supports", Locked=true, Opened = false })
-secSupports:Button({ Title="Dusekkar", Locked=true, Callback=function() loadstring(game:HttpGet(""))() end })
-secSupports:Button({ Title="Elliot",   Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/cD2nYPxE"))() end })
+secSentinels:Button({ Title="Guest1337",                          Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/Kx5U4bLL"))() end })
+secSentinels:Button({ Title="Shedletsky (just use hitbox lol)", Locked=true, Callback=function() end })
+secSentinels:Button({ Title="Chance",                             Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/XnXQY5VD"))() end })
+secSentinels:Button({ Title="TwoTime",                            Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/4v3iUxhN"))() end })
+secSentinels:Button({ Title="Jane Doe",                           Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/YwkMhHE2"))() end })
+local secSupports  = tabChar:Section({ Title = "Supports", Opened = false })
+secSupports:Button({ Title="Dusekkar", Locked=true, Callback=function() end })
+secSupports:Button({ Title="Elliot",               Callback=function() loadstring(game:HttpGet("https://pastebin.com/raw/cD2nYPxE"))() end })
 
 ------------------------------------------------------------------------
 ------------------------------------------------------------------------
@@ -1265,4 +1224,9 @@ secSupports:Button({ Title="Elliot",   Callback=function() loadstring(game:HttpG
 ------------------------------------------------------------------------
 local tabInterface = win:Tab({ Title = "Interface", Icon = "scan" })
 tabInterface:Section({ Title = "UI Functions", Opened = true })
-tabInterface:Button({ Title = "Close UI", Callback = function() win:Destroy() end })
+
+-- FIX: wrap in pcall since WindUI may use Close() or Destroy() depending on version
+tabInterface:Button({ Title = "Close UI", Callback = function()
+    local ok = pcall(function() win:Destroy() end)
+    if not ok then pcall(function() win:Close() end) end
+end })
